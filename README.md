@@ -1,5 +1,15 @@
 # dictator.nvim
 
+The fate of this `ft=markdown` rests on your shoulders, but your eyes glaze over when you see a word count in the thousands.
+
+You could read it silently,
+
+you could read it aloud,
+
+or you could have it read aloud to you, with a scrubber that follows along in the text without even leaving the comfort of your buffer.
+
+---
+
 Read a markdown buffer aloud with [Piper](https://github.com/OHF-Voice/piper1-gpl) TTS,
 following along in the text: the playback scrubber opens in a vertical split and the line
 being read is highlighted in the original buffer.
