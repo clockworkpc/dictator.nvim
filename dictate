@@ -9,6 +9,7 @@
 #   dictate seek N | +N | -N                  jump to / by chunk
 #   dictate next | prev                       seek +1 / -1
 #   dictate status                            one-line status
+#   dictate rundir                            print the session state directory
 #
 #   -i  pick the voice with fzf; VOICE may be omitted or used as the picker's query
 #
@@ -93,6 +94,10 @@ expand_markup() {
       for (i = 1; i <= k; i++) arr[i] = clean(arr[i])
       return k
     }
+    # Every emitted line carries its source line number as a trailing \002N tag, so the
+    # chunker can record where each chunk came from and an editor can follow along.
+    # Trailing rather than leading, so the "^"-anchored strips downstream still work.
+    function emit(n, s) { if (trim(s) == "") print ""; else print s "\002" n }
     function is_item(l) { return l ~ /^[[:space:]]*[-*+][[:space:]]+/ }
     function indent_of(l) { match(l, /^[[:space:]]*/); return RLENGTH }
     function item_text(l) { sub(/^[[:space:]]*[-*+][[:space:]]+/, "", l); return trim(l) }
@@ -111,7 +116,7 @@ expand_markup() {
               h = (j <= nh && H[j] != "") ? H[j] : ("Column " j)
               c = C[j]
               if (c !~ /[.!?:;]$/) c = c "."
-              print h ": " c
+              emit(i, h ": " c)
             }
             print ""
             i++
@@ -131,9 +136,9 @@ expand_markup() {
           if (t != "" && t !~ /[.,;:!?]$/) t = t ((j <= NR && is_item(L[j])) ? "," : ".")
           # \001 marks an item start: the chunker breaks there and the chime is
           # prepended to that chunk at synthesis
-          print "\001" t
+          emit(i, "\001" t)
           i = k
-        } else { print L[i]; i++ }
+        } else { emit(i, L[i]); i++ }
       }
     }'
 }
@@ -167,22 +172,30 @@ build_chunks() { # build_chunks INPUT -> prints "TOTAL CHARS"
               s/^[[:space:]]*#+[[:space:]]*//
               s/^[[:space:]]*>+[[:space:]]*//
               s/[*`|]//g; s/_/ /g' \
-    | awk -v dir="$S/chunks" -v sizes="$S/sizes" -v marks="$S/marks" -v max="$CHUNK_CHARS" '
+    | awk -v dir="$S/chunks" -v sizes="$S/sizes" -v marks="$S/marks" -v lines="$S/lines" -v max="$CHUNK_CHARS" '
         function flush(  f) {
           if (buf == "") return
           f = sprintf("%s/%04d.txt", dir, n)
           print buf > f; close(f)
           print length(buf) > sizes
           print mark > marks           # 1 = chunk opens a list item, so chime it
+          print src > lines            # source line this chunk starts on
           mark = 0                     # a long item spilling over does not re-chime
+          src = 0
           total += length(buf); n++
           buf = ""
         }
-        BEGIN { n = 0; buf = ""; total = 0; mark = 0; printf "" > sizes; printf "" > marks }
+        BEGIN { n = 0; buf = ""; total = 0; mark = 0; src = 0
+                printf "" > sizes; printf "" > marks; printf "" > lines }
         /^[[:space:]]*$/ { flush(); next }
         {
           gsub(/\r/, "")
-          if (index($0, "\001") == 1) { flush(); mark = 1; sub(/\001/, "") }
+          if (match($0, /\002[0-9]+$/)) {
+            srcline = substr($0, RSTART + 1)
+            $0 = substr($0, 1, RSTART - 1)
+            if (src == 0) src = srcline
+          }
+          if (index($0, "\001") == 1) { flush(); mark = 1; sub(/\001/, ""); src = srcline }
           k = split($0, w, /[[:space:]]+/)
           for (i = 1; i <= k; i++) {
             if (w[i] == "") continue
@@ -541,6 +554,7 @@ if [[ -n "$cmd" && ! -e "$cmd" ]]; then
     toggle) do_toggle; exit 0 ;;
     stop|quit|kill) kill_session; exit 0 ;;
     status) status_line; exit $? ;;
+    rundir) printf '%s\n' "$S"; exit 0 ;;
     speed) shift; [[ $# -ge 1 ]] || die "usage: $PROG speed N|+N|-N"; do_speed "$1"; exit 0 ;;
     seek) shift; [[ $# -ge 1 ]] || die "usage: $PROG seek N|+N|-N"; do_seek "$1"; exit 0 ;;
     next) do_seek +1; exit 0 ;;

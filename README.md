@@ -1,7 +1,11 @@
-# dictate
+# dictator.nvim
 
-Read a text or markdown file aloud with [Piper](https://github.com/OHF-Voice/piper1-gpl) TTS,
-with transport controls: pause, resume, seek, live speed changes, and a terminal scrubber.
+Read a markdown buffer aloud with [Piper](https://github.com/OHF-Voice/piper1-gpl) TTS,
+following along in the text: the playback scrubber opens in a vertical split and the line
+being read is highlighted in the original buffer.
+
+It is two pieces — a Neovim plugin, and the `dictate` CLI it drives. The CLI is useful on
+its own (transport controls, WM hotkeys), and the plugin is a thin layer over it.
 
 ```
   dictate ── proposal-updated-20260816.md ── en_GB-alan-medium
@@ -13,11 +17,55 @@ with transport controls: pause, resume, seek, live speed changes, and a terminal
   space pause  ←/→ seek  [/] speed  r restart chunk  d detach  q quit
 ```
 
-## Install
+## Neovim plugin
+
+```lua
+-- lazy.nvim
+{
+  "dictator.nvim",
+  dir = "~/Development/dictator.nvim",
+  ft = "markdown",
+  build = "ln -sfn $PWD/dictate ~/.local/bin/dictate",   -- the CLI must be on PATH
+  opts = {},                                            -- setup() is optional
+}
+```
+
+Open a markdown file and run `:DictatorStart`. The scrubber appears in a vertical split,
+focus stays in your text, and the line being read is highlighted as playback moves.
+
+| Command | Effect |
+| --- | --- |
+| `:DictatorStart [voice] [speed]` | Read the current buffer, unsaved edits included |
+| `:DictatorToggle` | Pause / resume |
+| `:DictatorSpeed {N\|+N\|-N}` | Set or nudge speed (length scale, lower = faster) |
+| `:DictatorJump [line]` | Jump playback to a buffer line — cursor line by default, or `:89DictatorJump` |
+| `:DictatorSeek {N\|+N\|-N}` | Seek by chunk |
+| `:DictatorStop` | Stop and close the split |
+| `:DictatorStatus` | Status in a notification |
+
+Options, shown with their defaults:
+
+```lua
+require("dictator").setup({
+  cmd = "dictate",                  -- CLI name or absolute path
+  voice = nil, speed = nil,         -- nil = the CLI defaults (alan, 0.7)
+  split = "vsplit", width = 52,     -- the scrubber window
+  filetypes = { markdown = true },  -- set to nil to allow any buffer
+  follow = true,                    -- keep the read line in view
+  hl_group = "DictatorLine",        -- links to Visual unless you define it
+})
+```
+
+The buffer is read as it currently stands, unsaved changes included, so the highlighted
+line always matches what is on screen. `:DictatorJump` maps a buffer line to the chunk
+that starts at or before it, which is exact for list items and table rows since each gets
+its own chunk.
+
+## Install (CLI only)
 
 ```bash
-git clone <this repo> ~/Development/dictate
-ln -sfn ~/Development/dictate/dictate ~/.local/bin/dictate
+git clone <this repo> ~/Development/dictator.nvim
+ln -sfn ~/Development/dictator.nvim/dictate ~/.local/bin/dictate
 ```
 
 Requires `piper-tts` and `pw-play` on PATH, plus `jq` and `awk`. `sox` generates the
@@ -191,3 +239,7 @@ seconds-per-character rather than a guess.
 | `DICTATE_RUN_DIR`      | `/run/user/$UID/dictate` | Session state dir; override to run isolated sessions |
 | `DICTATE_CHIME`        | `on`                     | `off` disables the list-item chime |
 | `DICTATE_CHIME_DB`     | `-20`                    | Chime peak in dBFS; less negative = more present |
+
+The CLI also prints its session directory with `dictate rundir`; the plugin uses that to
+follow playback by reading the state files directly, including `lines`, which records the
+source line each chunk came from.
