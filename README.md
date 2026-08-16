@@ -59,42 +59,38 @@ terminal started even when the WM passes a stripped environment. `XDG_RUNTIME_DI
 also re-derived if missing, since `pw-play` needs it to reach the PipeWire socket.
 Both were verified under `env -i`.
 
-**Hyprland** (`~/.config/hypr/hyprland.conf`):
-
-```
-bind = SUPER SHIFT, space,  exec, dictate toggle
-bind = SUPER SHIFT, right,  exec, dictate next
-bind = SUPER SHIFT, left,   exec, dictate prev
-bind = SUPER SHIFT, bracketright, exec, dictate speed -0.05
-bind = SUPER SHIFT, bracketleft,  exec, dictate speed +0.05
-bind = SUPER SHIFT, escape, exec, dictate stop
-```
-
-**AwesomeWM** (`~/.config/awesome/rc.lua`, after `globalkeys` is defined):
+**AwesomeWM** — add to your `globalkeys` table (`gears.table.join`), for example in
+`keybindings.lua`:
 
 ```lua
+-- Absolute path so the bindings work regardless of awesome's PATH
 local dictate = os.getenv("HOME") .. "/.local/bin/dictate"
 
-globalkeys = gears.table.join(globalkeys,
-  awful.key({ modkey, "Shift" }, "space",  function() awful.spawn({dictate, "toggle"}) end,
-            {description = "pause / resume", group = "dictate"}),
-  awful.key({ modkey, "Shift" }, "Right",  function() awful.spawn({dictate, "next"}) end,
-            {description = "next chunk", group = "dictate"}),
-  awful.key({ modkey, "Shift" }, "Left",   function() awful.spawn({dictate, "prev"}) end,
-            {description = "previous chunk", group = "dictate"}),
-  awful.key({ modkey, "Shift" }, "]",      function() awful.spawn({dictate, "speed", "-0.05"}) end,
-            {description = "faster", group = "dictate"}),
-  awful.key({ modkey, "Shift" }, "[",      function() awful.spawn({dictate, "speed", "+0.05"}) end,
-            {description = "slower", group = "dictate"}),
-  awful.key({ modkey, "Shift" }, "Escape", function() awful.spawn({dictate, "stop"}) end,
-            {description = "stop", group = "dictate"})
-)
-root.keys(globalkeys)
+awful.key({ modkey, "Control", "Shift" }, "space", function() awful.spawn({ dictate, "toggle" }) end,
+  { description = "pause/resume reading", group = "dictate" }),
+awful.key({ modkey, "Control", "Shift" }, "Right", function() awful.spawn({ dictate, "next" }) end,
+  { description = "next chunk", group = "dictate" }),
+awful.key({ modkey, "Control", "Shift" }, "Left", function() awful.spawn({ dictate, "prev" }) end,
+  { description = "previous chunk", group = "dictate" }),
+awful.key({ modkey, "Control", "Shift" }, "bracketright", function() awful.spawn({ dictate, "speed", "-0.05" }) end,
+  { description = "read faster", group = "dictate" }),
+awful.key({ modkey, "Control", "Shift" }, "bracketleft", function() awful.spawn({ dictate, "speed", "+0.05" }) end,
+  { description = "read slower", group = "dictate" }),
+awful.key({ modkey, "Control", "Shift" }, "Escape", function() awful.spawn({ dictate, "stop" }) end,
+  { description = "stop reading", group = "dictate" }),
+awful.key({ modkey, "Control", "Shift" }, "s", function()
+  awful.spawn.easy_async({ dictate, "status" }, function(stdout, stderr)
+    local text = stdout ~= "" and stdout or stderr
+    if text == "" then text = "no session" end
+    naughty.notify({ title = "dictate", text = text:gsub("%s+$", ""), timeout = 4 })
+  end)
+end, { description = "reading status", group = "dictate" }),
 ```
 
-The Lua form passes an absolute path and an argument table, so it needs neither a shell
-nor `~/.local/bin` on awesome's `PATH`. Adjust the modifiers to taste — `SUPER+space` is
-a layout-switch or launcher binding in many configs.
+Passing an absolute path plus an argument table means the bindings need neither a shell
+nor `~/.local/bin` on awesome's `PATH` — the usual reason these fail silently. Since a
+detached session has no visible UI, the `s` binding pops the status line as a `naughty`
+notification.
 
 ## How it works
 
