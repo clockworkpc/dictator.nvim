@@ -11,11 +11,17 @@ or you could have it read aloud to you, with a scrubber that follows along in th
 ---
 
 Read a markdown buffer aloud with [Piper](https://github.com/OHF-Voice/piper1-gpl) TTS,
-following along in the text: the playback scrubber opens in a floating panel and the line
-being read is highlighted in the original buffer.
+following along in the text: the playback scrubber opens in a narrow panel beside the
+buffer and the line being read is highlighted in the original.
 
 It is two pieces — a Neovim plugin, and the `dictate` CLI it drives. The CLI is useful on
 its own (transport controls, WM hotkeys), and the plugin is a thin layer over it.
+
+![The transport panel in a split beside the markdown buffer, reading this README](assets/panel.png)
+
+The panel is an ordinary buffer — `p` pauses, `h`/`l` seek — and the document reflows into
+the columns it does not use. Driven from a shell instead, the CLI draws the same thing as
+a terminal TUI:
 
 ```
   dictate ── proposal-updated-20260816.md ── en_GB-alan-medium
