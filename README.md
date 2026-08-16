@@ -119,6 +119,29 @@ cells than headers falls back to "Column N".
 Underscores become spaces rather than being deleted, so `domain_name` reads as
 "domain name" instead of "domainname".
 
+### Lists
+
+Bullets lose their marker and gain punctuation, so a list reads as one flowing sentence
+instead of a run of abrupt fragments: a comma after every item, a full stop after the
+last. Items that already end in punctuation are left alone.
+
+```
+- Bulk add and CSV import/export for spreadsheet-style data entry
+- Live status & scheduled-jobs dashboard (Turbo Streams)
+- Per-domain stop control and manual re-validation
+```
+
+reads as:
+
+> Bulk add and CSV import/export for spreadsheet-style data entry, Live status &
+> scheduled-jobs dashboard (Turbo Streams), Per-domain stop control and manual
+> re-validation.
+
+Wrapped items are folded into one item before punctuating, so the comma lands at the end
+rather than mid-sentence. Blank lines between items still count as one list, and nested
+items are treated as continuing the list. Applies to `-`, `*`, and `+` bullets; numbered
+lists are left as they are.
+
 ### Markup that is skipped
 
 Raw HTML is dropped, so print scaffolding like

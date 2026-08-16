@@ -77,10 +77,12 @@ wav_secs() { # 16-bit mono wav duration from size
 
 # ---------------------------------------------------------------- text chunking
 
-# Rewrite markdown tables as "Header: cell." sentences, one row per paragraph, so a
-# row reads as labelled fields with a pause between rows. Must run before the markdown
-# strip below, which deletes the '|' that delimits the cells.
-expand_tables() {
+# Structure markdown into speakable prose, before the markdown strip below removes the
+# '|' and '*' that delimit tables and bullets:
+#   - tables become "Header: cell." sentences, one row per paragraph
+#   - bullets lose their marker and gain a comma, or a full stop on the last item, so a
+#     list reads as one sentence instead of a run of abrupt fragments
+expand_markup() {
   awk '
     function trim(s) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s }
     function clean(s) { gsub(/\*\*|__|`/, "", s); return trim(s) }
@@ -91,6 +93,9 @@ expand_tables() {
       for (i = 1; i <= k; i++) arr[i] = clean(arr[i])
       return k
     }
+    function is_item(l) { return l ~ /^[[:space:]]*[-*+][[:space:]]+/ }
+    function indent_of(l) { match(l, /^[[:space:]]*/); return RLENGTH }
+    function item_text(l) { sub(/^[[:space:]]*[-*+][[:space:]]+/, "", l); return trim(l) }
     { L[NR] = $0 }
     END {
       i = 1
@@ -111,6 +116,21 @@ expand_tables() {
             print ""
             i++
           }
+        } else if (is_item(L[i])) {
+          d = indent_of(L[i])
+          t = item_text(L[i])
+          # A wrapped item continues on more-indented lines; fold them in first, so the
+          # punctuation lands at the end of the item rather than mid-sentence
+          k = i + 1
+          while (k <= NR && trim(L[k]) != "" && !is_item(L[k]) && indent_of(L[k]) > d) {
+            t = t " " trim(L[k]); k++
+          }
+          # Blank lines between items are still one list (a "loose" list)
+          j = k
+          while (j <= NR && trim(L[j]) == "") j++
+          if (t != "" && t !~ /[.,;:!?]$/) t = t ((j <= NR && is_item(L[j])) ? "," : ".")
+          print t
+          i = k
         } else { print L[i]; i++ }
       }
     }'
@@ -119,7 +139,7 @@ expand_tables() {
 build_chunks() { # build_chunks INPUT -> prints "TOTAL CHARS"
   local input="$1"
   mkdir -p "$S/chunks" "$S/wav"
-  expand_tables <"$input" \
+  expand_markup <"$input" \
     | sed -E 's/<!--.*-->//g; s#</?[a-zA-Z][^>]*>##g' \
     | sed -E 's/\[([^]]*)\]\([^)]*\)/\1/g
               s/^[[:space:]]*#+[[:space:]]*//
