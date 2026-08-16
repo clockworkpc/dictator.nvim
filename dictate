@@ -1,0 +1,435 @@
+#!/usr/bin/env bash
+# dictate - read a text/markdown file aloud with Piper TTS, with transport controls.
+#
+#   dictate [-i] [-b] INPUT [VOICE] [SPEED]   start reading (attaches the TUI unless -b)
+#   dictate tui                               attach the live scrubber to a running session
+#   dictate pause | resume | toggle           pause / resume playback
+#   dictate stop | quit                       stop playback and end the session
+#   dictate speed N | +N | -N                 set length scale (lower = faster)
+#   dictate seek N | +N | -N                  jump to / by chunk
+#   dictate next | prev                       seek +1 / -1
+#   dictate status                            one-line status
+#
+#   -i  pick the voice with fzf; VOICE may be omitted or used as the picker's query
+#
+# Playback runs as a detached session, so the subcommands work from any shell or a
+# window-manager hotkey. Speed is piper's length scale and is baked in at synthesis
+# time, so changing it re-synthesizes from the current chunk onward.
+set -euo pipefail
+
+PROG="$(basename "$0")"
+VOICE_ROOT="${PIPER_VOICE_ROOT:-/usr/share/piper-voices}"
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/dictate"
+S="$RUN_DIR/session"
+CHUNK_CHARS="${DICTATE_CHUNK_CHARS:-320}"
+PLAYER="${DICTATE_PLAYER:-pw-play}"
+
+usage() {
+  awk 'NR>1 { if (/^#/) { sub(/^# ?/, ""); print } else exit }' "$0"
+  exit "${1:-1}"
+}
+die() { echo "$PROG: $*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- state helpers
+
+sput() { # sput KEY VALUE  (atomic)
+  printf '%s\n' "$2" >"$S/.$1.tmp" && mv -f "$S/.$1.tmp" "$S/$1"
+}
+sget() { # sget KEY [DEFAULT]
+  if [[ -f "$S/$1" ]]; then IFS= read -r v <"$S/$1" || true; printf '%s' "$v"
+  else printf '%s' "${2:-}"; fi
+}
+valid_speed() { [[ "$1" =~ ^[0-9]*\.?[0-9]+$ ]]; }
+alive() { [[ -n "${1:-}" ]] && kill -0 "$1" 2>/dev/null; }
+
+session_pid() { local p; p="$(sget pid)"; alive "$p" && printf '%s' "$p"; }
+need_session() { [[ -n "$(session_pid)" ]] || die "no session running"; }
+
+now() { date +%s.%N; }
+fmt_hms() { # seconds -> m:ss / h:mm:ss
+  local t=${1%.*}
+  [[ -n "$t" ]] || t=0
+  [[ "$t" == -* ]] && { printf -- '--:--'; return; }
+  if ((t >= 3600)); then printf '%d:%02d:%02d' $((t/3600)) $((t%3600/60)) $((t%60))
+  else printf '%d:%02d' $((t/60)) $((t%60)); fi
+}
+wav_secs() { # 16-bit mono wav duration from size
+  local f="$1" rate bytes
+  [[ -f "$f" ]] || { printf '0'; return; }
+  rate="$(sget rate 22050)"
+  bytes=$(stat -c %s "$f")
+  awk -v b="$bytes" -v r="$rate" 'BEGIN{ d=(b-44)/(r*2); if(d<0)d=0; printf "%.3f", d }'
+}
+
+# ---------------------------------------------------------------- text chunking
+
+build_chunks() { # build_chunks INPUT -> prints "TOTAL CHARS"
+  local input="$1"
+  mkdir -p "$S/chunks" "$S/wav"
+  sed -E 's/\[([^]]*)\]\([^)]*\)/\1/g; s/[#*`_>|]//g' "$input" \
+    | awk -v dir="$S/chunks" -v sizes="$S/sizes" -v max="$CHUNK_CHARS" '
+        function flush(  f) {
+          if (buf == "") return
+          f = sprintf("%s/%04d.txt", dir, n)
+          print buf > f; close(f)
+          print length(buf) > sizes
+          total += length(buf); n++
+          buf = ""
+        }
+        BEGIN { n = 0; buf = ""; total = 0; printf "" > sizes }
+        /^[[:space:]]*$/ { flush(); next }
+        {
+          gsub(/\r/, "")
+          k = split($0, w, /[[:space:]]+/)
+          for (i = 1; i <= k; i++) {
+            if (w[i] == "") continue
+            buf = (buf == "" ? w[i] : buf " " w[i])
+            if (length(buf) >= max) flush()
+            else if (w[i] ~ /[.!?][")'"'"']*$/ && length(buf) >= max/3) flush()
+          }
+        }
+        END { flush(); close(sizes); print n, total }'
+}
+
+# ---------------------------------------------------------------- synthesis
+
+wav_for() { printf '%s/wav/%04d-%s.wav' "$S" "$1" "$2"; }
+
+synth() { # synth IDX SPEED  (idempotent, atomic)
+  local idx="$1" speed="$2" out chunk tmp model
+  out="$(wav_for "$idx" "$speed")"
+  [[ -s "$out" ]] && return 0
+  chunk="$(printf '%s/chunks/%04d.txt' "$S" "$idx")"
+  [[ -f "$chunk" ]] || return 1
+  model="$(sget model)"
+  tmp="$out.$$.tmp"
+  if piper-tts -q -m "$model" --length_scale "$speed" -f "$tmp" <"$chunk" 2>/dev/null && [[ -s "$tmp" ]]; then
+    mv -f "$tmp" "$out"
+  else
+    rm -f "$tmp"; return 1
+  fi
+}
+
+# ---------------------------------------------------------------- daemon
+
+daemon_cleanup() {
+  local pp; pp="$(sget playpid)"
+  if alive "$pp"; then kill -CONT "$pp" 2>/dev/null || true; kill -TERM "$pp" 2>/dev/null || true; fi
+  sput playpid ""
+  [[ "$(sget state)" == done ]] || sput state stopped
+}
+
+daemon() {
+  trap 'daemon_cleanup; exit 0' TERM INT
+  trap 'daemon_cleanup' EXIT
+  sput pid "$$"
+  sput pgid "$(ps -o pgid= -p $$ | tr -d ' ')"
+  sput state playing
+
+  local total idx speed wav dur pp rc cmd arg
+  total="$(sget total 0)"
+
+  while :; do
+    idx="$(sget idx 0)"
+    (( idx < 0 )) && { idx=0; sput idx 0; }
+    if (( idx >= total )); then sput state done; break; fi
+    speed="$(sget speed 0.7)"
+
+    if ! synth "$idx" "$speed"; then sput idx $((idx+1)); continue; fi
+    wav="$(wav_for "$idx" "$speed")"
+    dur="$(wav_secs "$wav")"
+
+    # prefetch the next chunk while this one plays
+    ( synth $((idx+1)) "$speed" >/dev/null 2>&1 || true ) &
+
+    sput dur "$dur"
+    sput paused_acc 0
+    sput started "$(now)"
+    "$PLAYER" "$wav" >/dev/null 2>&1 &
+    pp=$!
+    sput playpid "$pp"
+    [[ "$(sget state)" == paused ]] && kill -STOP "$pp" 2>/dev/null || true
+
+    rc=0; wait "$pp" || rc=$?
+    sput playpid ""
+
+    cmd="$(sget cmd)"; sput cmd ""
+    if [[ -n "$cmd" ]]; then
+      arg="${cmd#* }"
+      case "$cmd" in
+        respeak*) : ;;                        # same idx, new speed
+        goto*)    sput idx "$arg" ;;
+        *)        : ;;
+      esac
+      continue
+    fi
+    (( rc > 128 )) && continue                # killed without a queued command
+    sput idx $((idx+1))
+  done
+}
+
+# ---------------------------------------------------------------- transport
+
+kill_session() {
+  local p g; p="$(sget pid)"; g="$(sget pgid)"
+  if alive "$p"; then
+    kill -CONT "$p" 2>/dev/null || true
+    [[ -n "$g" ]] && kill -TERM "-$g" 2>/dev/null || kill -TERM "$p" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do alive "$p" || break; sleep 0.05; done
+    alive "$p" && { [[ -n "$g" ]] && kill -KILL "-$g" 2>/dev/null || kill -KILL "$p" 2>/dev/null || true; }
+  fi
+  pkill -f "$PLAYER .*$RUN_DIR" 2>/dev/null || true
+  sput state stopped 2>/dev/null || true
+  sput playpid "" 2>/dev/null || true
+}
+
+do_pause() {
+  need_session
+  [[ "$(sget state)" == playing ]] || return 0
+  local pp; pp="$(sget playpid)"
+  alive "$pp" && kill -STOP "$pp" 2>/dev/null || true
+  sput paused_at "$(now)"
+  sput state paused
+}
+do_resume() {
+  need_session
+  [[ "$(sget state)" == paused ]] || return 0
+  local pp at acc; pp="$(sget playpid)"; at="$(sget paused_at 0)"; acc="$(sget paused_acc 0)"
+  sput paused_acc "$(awk -v a="$acc" -v t="$at" -v n="$(now)" 'BEGIN{printf "%.3f", a + (t>0 ? n-t : 0)}')"
+  sput paused_at 0
+  sput state playing
+  alive "$pp" && kill -CONT "$pp" 2>/dev/null || true
+}
+do_toggle() { [[ "$(sget state)" == paused ]] && do_resume || do_pause; }
+
+interrupt() { # interrupt CMD  -- queue a command and cut the current chunk short
+  local pp; pp="$(sget playpid)"
+  sput cmd "$1"
+  if alive "$pp"; then kill -CONT "$pp" 2>/dev/null || true; kill -TERM "$pp" 2>/dev/null || true; fi
+}
+
+do_speed() {
+  need_session
+  local arg="$1" cur new
+  cur="$(sget speed 0.7)"
+  case "$arg" in
+    +*|-*) new="$(awk -v c="$cur" -v d="$arg" 'BEGIN{v=c+d; if(v<0.2)v=0.2; if(v>3)v=3; printf "%.2f", v}')" ;;
+    *) valid_speed "$arg" || die "speed must be a number (length scale, lower = faster)"; new="$arg" ;;
+  esac
+  sput speed "$new"
+  [[ "$(sget state)" == paused ]] && do_resume
+  interrupt "respeak"
+  printf '%s\n' "$new"
+}
+
+do_seek() {
+  need_session
+  local arg="$1" idx total new
+  idx="$(sget idx 0)"; total="$(sget total 0)"
+  case "$arg" in
+    +*|-*) new=$((idx + arg)) ;;
+    *) [[ "$arg" =~ ^[0-9]+$ ]] || die "seek takes N, +N or -N"; new="$arg" ;;
+  esac
+  (( new < 0 )) && new=0
+  (( new > total )) && new=$total
+  [[ "$(sget state)" == paused ]] && do_resume
+  sput idx "$new"
+  interrupt "goto $new"
+}
+
+# ---------------------------------------------------------------- status / TUI
+
+progress() { # -> "done_chars total_chars frac_elapsed secs_left"
+  local idx total dur started acc st paused_at elapsed
+  idx="$(sget idx 0)"; total="$(sget total 0)"; dur="$(sget dur 0)"
+  started="$(sget started 0)"; acc="$(sget paused_acc 0)"; st="$(sget state)"
+  paused_at="$(sget paused_at 0)"
+  elapsed="$(awk -v s="$started" -v n="$(now)" -v a="$acc" -v p="$paused_at" -v st="$st" '
+      BEGIN{ if(s<=0){print 0; exit} e=(st=="paused"&&p>0 ? p : n)-s-a; if(e<0)e=0; printf "%.3f", e }')"
+  awk -v idx="$idx" -v total="$total" -v dur="$dur" -v el="$elapsed" -v sizes="$S/sizes" '
+      BEGIN{
+        n=0; while((getline line < sizes) > 0){ sz[n++]=line; all+=line }
+        for(i=0;i<idx && i<n;i++) done+=sz[i]
+        cur = (idx<n ? sz[idx] : 0)
+        frac = (dur>0 ? el/dur : 0); if(frac>1) frac=1
+        done_now = done + cur*frac
+        rate = (cur>0 && dur>0 ? dur/cur : 0)
+        left = (dur>0 ? (all-done_now) * rate : -1)
+        printf "%d %d %.4f %.1f\n", done_now, all, frac, left
+      }'
+}
+
+status_line() {
+  local st idx total speed title voice
+  st="$(sget state none)"; idx="$(sget idx 0)"; total="$(sget total 0)"
+  speed="$(sget speed 0.7)"; title="$(sget title)"; voice="$(sget voice)"
+  [[ -n "$(session_pid)" ]] || { [[ "$st" == done ]] || st="none"; }
+  if [[ "$st" == none ]]; then echo "no session"; return 1; fi
+  read -r dc ac frac left < <(progress) || true
+  printf '%s  %s  %s  chunk %d/%d  %d%%  ~%s left  speed %s\n' \
+    "$st" "$title" "$voice" $((idx+1)) "$total" \
+    "$(awk -v d="$dc" -v a="$ac" 'BEGIN{printf "%d", (a>0? d*100/a : 0)}')" \
+    "$(fmt_hms "$left")" "$speed"
+}
+
+tui() {
+  [[ -t 0 && -t 1 ]] || die "tui needs a terminal"
+  need_session
+  local saved_stty; saved_stty="$(stty -g)"
+  # shellcheck disable=SC2064
+  trap "stty '$saved_stty' 2>/dev/null; tput cnorm 2>/dev/null; printf '\n'" EXIT INT TERM
+  tput civis 2>/dev/null || true
+  printf '\033[2J'
+
+  local key rest st idx total speed title voice text bar i cells filled dc ac frac left cols
+  while :; do
+    st="$(sget state none)"
+    [[ -n "$(session_pid)" || "$st" == done ]] || break
+    idx="$(sget idx 0)"; total="$(sget total 0)"; speed="$(sget speed 0.7)"
+    title="$(sget title)"; voice="$(sget voice)"
+    cols=$(tput cols 2>/dev/null || echo 80); (( cols > 78 )) && cols=78
+    read -r dc ac frac left < <(progress) || true
+
+    cells=24
+    filled=$(awk -v d="$dc" -v a="$ac" -v c="$cells" 'BEGIN{ v=(a>0? d*c/a : 0); printf "%d", (v>c?c:v) }')
+    bar=""
+    for ((i = 0; i < cells; i++)); do [[ $i -lt $filled ]] && bar+="█" || bar+="░"; done
+
+    text="$(tr '\n' ' ' < "$(printf '%s/chunks/%04d.txt' "$S" "$idx")" 2>/dev/null || true)"
+    text="${text:0:$((cols * 2 - 8))}"
+
+    printf '\033[H'
+    printf '  \033[1mdictate\033[0m ── %s ── %s\033[K\n\033[K\n' "$title" "$voice"
+    case "$st" in
+      playing) printf '  \033[32m▶\033[0m ' ;;
+      paused)  printf '  \033[33m⏸\033[0m ' ;;
+      done)    printf '  \033[34m■\033[0m ' ;;
+      *)       printf '  \033[31m■\033[0m ' ;;
+    esac
+    printf ' chunk %d/%d  %s  %d%%  ~%s left  speed %s\033[K\n\033[K\n' \
+      $((idx+1)) "$total" "$bar" \
+      "$(awk -v d="$dc" -v a="$ac" 'BEGIN{printf "%d", (a>0? d*100/a : 0)}')" \
+      "$(fmt_hms "$left")" "$speed"
+    printf '  \033[2m%s\033[0m\033[K\n\033[K\n' "${text:0:$((cols-4))}"
+    printf '  \033[2mspace\033[0m pause  \033[2m←/→\033[0m seek  \033[2m[/]\033[0m speed  \033[2mr\033[0m restart chunk  \033[2md\033[0m detach  \033[2mq\033[0m quit\033[K\n\033[J'
+
+    [[ "$st" == done ]] && { sleep 1; break; }
+
+    key=""; rest=""
+    IFS= read -rsn1 -t 0.25 key || true
+    [[ -z "$key" ]] && continue
+    if [[ "$key" == $'\e' ]]; then IFS= read -rsn2 -t 0.02 rest || true; key+="$rest"; fi
+    case "$key" in
+      ' ') do_toggle ;;
+      $'\e[C') do_seek +1 >/dev/null ;;
+      $'\e[D') do_seek -1 >/dev/null ;;
+      $'\e[A') do_speed -0.05 >/dev/null ;;
+      $'\e[B') do_speed +0.05 >/dev/null ;;
+      ']') do_speed -0.05 >/dev/null ;;
+      '[') do_speed +0.05 >/dev/null ;;
+      'r') do_seek "$(sget idx 0)" >/dev/null ;;
+      'd') break ;;
+      'q') kill_session; break ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------- start
+
+start() {
+  local interactive=0 detach=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -i|--interactive) interactive=1; shift ;;
+      -b|--bg|--detach) detach=1; shift ;;
+      -h|--help) usage 0 ;;
+      --) shift; break ;;
+      -*) die "unknown option '$1'" ;;
+      *) break ;;
+    esac
+  done
+
+  local input="${1:-}" arg_voice="${2:-}" arg_speed="${3:-}"
+  [[ -n "$input" ]] || usage
+  [[ -r "$input" ]] || die "cannot read '$input'"
+
+  # In interactive mode the voice comes from the picker, so a lone numeric
+  # second argument is the speed: `dictate -i input.txt 1.1`.
+  if [[ $interactive -eq 1 && -z "$arg_speed" ]] && valid_speed "${arg_voice:-x}"; then
+    arg_speed="$arg_voice"; arg_voice=""
+  fi
+  local voice="${arg_voice:-alan}" speed="${arg_speed:-0.7}" model voice_dir
+  valid_speed "$speed" || die "SPEED must be a number (length scale, lower = faster), got '$speed'"
+
+  if (( interactive )); then
+    command -v fzf >/dev/null || die "-i needs fzf on PATH"
+    local models picked
+    models=$(find "$VOICE_ROOT" -name '*.onnx' -printf '%f\t%h\n' 2>/dev/null | sed 's/\.onnx\t/\t/' | sort)
+    [[ -n "$models" ]] || die "no voice models found under $VOICE_ROOT"
+    picked=$(printf '%s\n' "$models" \
+      | fzf --with-nth=1 --delimiter='\t' --height=40% --reverse --query="$arg_voice" \
+            --prompt='voice> ' --header="voice models in $VOICE_ROOT" | head -n1)
+    [[ -n "$picked" ]] || die "no voice selected"
+    voice="${picked%%$'\t'*}"; voice_dir="${picked##*$'\t'}"
+  else
+    voice="en_GB-$voice-medium"; voice_dir="$VOICE_ROOT/en/en_GB/${arg_voice:-alan}/medium"
+  fi
+  model="$voice_dir/$voice.onnx"
+  [[ -f "$model" ]] || die "no voice model at $model"
+
+  [[ -n "$(session_pid)" ]] && kill_session
+  rm -rf "$S"; mkdir -p "$S/chunks" "$S/wav"
+
+  local counts total chars
+  counts="$(build_chunks "$input")"
+  total="${counts%% *}"; chars="${counts##* }"
+  (( total > 0 )) || die "nothing to read in '$input'"
+
+  sput input "$(readlink -f "$input")"
+  sput title "$(basename "$input")"
+  sput model "$model"
+  sput voice "$voice"
+  sput rate "$(jq -r '.audio.sample_rate // 22050' "$model.json" 2>/dev/null || echo 22050)"
+  sput speed "$speed"
+  sput idx 0
+  sput total "$total"
+  sput chars "$chars"
+  sput cmd ""
+  sput paused_acc 0
+  sput paused_at 0
+  sput state starting
+
+  setsid bash "$0" --daemon >>"$S/log" 2>&1 &
+  local i
+  for i in $(seq 1 60); do [[ -n "$(session_pid)" ]] && break; sleep 0.05; done
+  [[ -n "$(session_pid)" ]] || die "daemon failed to start (see $S/log)"
+
+  if (( detach )) || [[ ! -t 1 ]]; then
+    printf '%s  %s  %d chunks  speed %s\n' "$(sget title)" "$voice" "$total" "$speed"
+  else
+    tui
+  fi
+}
+
+# ---------------------------------------------------------------- dispatch
+
+mkdir -p "$S"
+
+cmd="${1:-}"
+if [[ -n "$cmd" && ! -e "$cmd" ]]; then
+  case "$cmd" in
+    --daemon) daemon; exit 0 ;;
+    tui|attach) shift; tui; exit 0 ;;
+    pause) do_pause; exit 0 ;;
+    resume|start|play) do_resume; exit 0 ;;
+    toggle) do_toggle; exit 0 ;;
+    stop|quit|kill) kill_session; exit 0 ;;
+    status) status_line; exit $? ;;
+    speed) shift; [[ $# -ge 1 ]] || die "usage: $PROG speed N|+N|-N"; do_speed "$1"; exit 0 ;;
+    seek) shift; [[ $# -ge 1 ]] || die "usage: $PROG seek N|+N|-N"; do_seek "$1"; exit 0 ;;
+    next) do_seek +1; exit 0 ;;
+    prev) do_seek -1; exit 0 ;;
+    -h|--help|help) usage 0 ;;
+  esac
+fi
+start "$@"
