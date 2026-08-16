@@ -51,15 +51,50 @@ dictate -b notes.md               # start detached, no TUI
 ### Controlling a running session
 
 Playback runs as a detached session, so the subcommands work from any shell — or from
-a window-manager binding:
+a window-manager binding.
+
+The state directory is resolved as `/run/user/$UID/dictate` whenever that exists, in
+preference to `$XDG_RUNTIME_DIR`, so a hotkey-spawned process finds the same session a
+terminal started even when the WM passes a stripped environment. `XDG_RUNTIME_DIR` is
+also re-derived if missing, since `pw-play` needs it to reach the PipeWire socket.
+Both were verified under `env -i`.
+
+**Hyprland** (`~/.config/hypr/hyprland.conf`):
 
 ```
-# Hyprland
-bind = SUPER, space,  exec, dictate toggle
-bind = SUPER, right,  exec, dictate next
-bind = SUPER, left,   exec, dictate prev
-bind = SUPER, escape, exec, dictate stop
+bind = SUPER SHIFT, space,  exec, dictate toggle
+bind = SUPER SHIFT, right,  exec, dictate next
+bind = SUPER SHIFT, left,   exec, dictate prev
+bind = SUPER SHIFT, bracketright, exec, dictate speed -0.05
+bind = SUPER SHIFT, bracketleft,  exec, dictate speed +0.05
+bind = SUPER SHIFT, escape, exec, dictate stop
 ```
+
+**AwesomeWM** (`~/.config/awesome/rc.lua`, after `globalkeys` is defined):
+
+```lua
+local dictate = os.getenv("HOME") .. "/.local/bin/dictate"
+
+globalkeys = gears.table.join(globalkeys,
+  awful.key({ modkey, "Shift" }, "space",  function() awful.spawn({dictate, "toggle"}) end,
+            {description = "pause / resume", group = "dictate"}),
+  awful.key({ modkey, "Shift" }, "Right",  function() awful.spawn({dictate, "next"}) end,
+            {description = "next chunk", group = "dictate"}),
+  awful.key({ modkey, "Shift" }, "Left",   function() awful.spawn({dictate, "prev"}) end,
+            {description = "previous chunk", group = "dictate"}),
+  awful.key({ modkey, "Shift" }, "]",      function() awful.spawn({dictate, "speed", "-0.05"}) end,
+            {description = "faster", group = "dictate"}),
+  awful.key({ modkey, "Shift" }, "[",      function() awful.spawn({dictate, "speed", "+0.05"}) end,
+            {description = "slower", group = "dictate"}),
+  awful.key({ modkey, "Shift" }, "Escape", function() awful.spawn({dictate, "stop"}) end,
+            {description = "stop", group = "dictate"})
+)
+root.keys(globalkeys)
+```
+
+The Lua form passes an absolute path and an argument table, so it needs neither a shell
+nor `~/.local/bin` on awesome's `PATH`. Adjust the modifiers to taste — `SUPER+space` is
+a layout-switch or launcher binding in many configs.
 
 ## How it works
 
@@ -88,4 +123,4 @@ seconds-per-character rather than a guess.
 | `PIPER_VOICE_ROOT`     | `/usr/share/piper-voices` | Where `-i` searches for `.onnx`  |
 | `DICTATE_CHUNK_CHARS`  | `320`                    | Target chunk size; also seek granularity |
 | `DICTATE_PLAYER`       | `pw-play`                | Player command (`paplay`, `aplay`) |
-| `XDG_RUNTIME_DIR`      | `/tmp`                   | Parent of the session state dir  |
+| `DICTATE_RUN_DIR`      | `/run/user/$UID/dictate` | Session state dir; override to run isolated sessions |

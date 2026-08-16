@@ -19,8 +19,22 @@ set -euo pipefail
 
 PROG="$(basename "$0")"
 VOICE_ROOT="${PIPER_VOICE_ROOT:-/usr/share/piper-voices}"
-RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/dictate"
+# Resolve the state dir identically however we were launched: a WM hotkey
+# (Hyprland exec, awful.spawn) may not carry XDG_RUNTIME_DIR, and the controls
+# must still find the session a terminal started.
+if [[ -n "${DICTATE_RUN_DIR:-}" ]]; then
+  RUN_DIR="$DICTATE_RUN_DIR"
+elif [[ -d "/run/user/$(id -u)" ]]; then
+  RUN_DIR="/run/user/$(id -u)/dictate"
+elif [[ -n "${XDG_RUNTIME_DIR:-}" && -d "$XDG_RUNTIME_DIR" ]]; then
+  RUN_DIR="$XDG_RUNTIME_DIR/dictate"
+else
+  RUN_DIR="/tmp/dictate-$(id -u)"
+fi
 S="$RUN_DIR/session"
+# pw-play finds the PipeWire socket through XDG_RUNTIME_DIR; a hotkey-spawned
+# process may not have it, so fall back to the standard path.
+[[ -z "${XDG_RUNTIME_DIR:-}" && -d "/run/user/$(id -u)" ]] && export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 CHUNK_CHARS="${DICTATE_CHUNK_CHARS:-320}"
 PLAYER="${DICTATE_PLAYER:-pw-play}"
 
