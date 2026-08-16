@@ -2,8 +2,8 @@
 --
 -- The heavy lifting lives in the `dictate` CLI: it chunks the markdown, synthesizes it
 -- with Piper, and exposes a session as plain state files. This module starts the CLI
--- detached, polls that state into a floating transport panel, and highlights the source
--- line being read.
+-- detached, polls that state into a transport panel beside the text, and highlights the
+-- source line being read.
 
 local ui = require("dictator.ui")
 
@@ -13,10 +13,11 @@ local config = {
   cmd = "dictate", -- CLI on PATH, or an absolute path
   voice = nil, -- nil = the CLI default (alan)
   speed = nil, -- nil = the CLI default (0.7)
-  win = { -- the floating transport panel
-    width = 76,
-    border = "rounded",
-    position = "center", -- center | top | bottom | top-right | bottom-right | …
+  win = { -- the transport panel
+    style = "split", -- split (right-hand, the text reflows beside it) | float
+    width = 0.25, -- a fraction of the editor, or an absolute number of columns
+    border = "rounded", -- float only
+    position = "top-right", -- float only
   },
   filetypes = { markdown = true }, -- set to nil to allow any buffer
   follow = true, -- scroll the source window to keep the read line visible
@@ -29,6 +30,7 @@ local state = {
   src_buf = nil, -- buffer being read
   src_win = nil, -- window showing it
   timer = nil,
+  gen = 0, -- session generation, so callbacks queued for an old session stay out of a new one
   rundir = nil,
   lines = nil, -- chunk index (0-based) -> source line
   sizes = nil, -- chunk index (0-based) -> character count
@@ -258,24 +260,34 @@ local function update()
 
   if info.state == "done" then
     stop_timer()
+    local gen = state.gen
     vim.defer_fn(function()
-      M.stop({ keep_session = true })
+      if state.gen == gen then
+        M.stop({ keep_session = true })
+      end
     end, 1500)
   end
 end
 
 local function start_timer()
   stop_timer()
+  local gen = state.gen
   state.timer = vim.loop.new_timer()
   state.timer:start(100, config.poll_ms, function()
-    vim.schedule(update)
+    vim.schedule(function()
+      -- a poll queued for a session that has since been replaced must not touch this one
+      if state.gen == gen then
+        update()
+      end
+    end)
   end)
 end
 
 -- Redraw sooner than the next poll, once the CLI has had a moment to act
 local function refresh()
+  local gen = state.gen
   vim.defer_fn(function()
-    if state.rundir then
+    if state.gen == gen and state.rundir then
       update()
     end
   end, 80)
@@ -358,6 +370,7 @@ function M.start(opts)
   end
 
   M.stop({ silent = true })
+  state.gen = state.gen + 1
 
   -- Read the buffer as it is now, unsaved edits included, so the line numbers the CLI
   -- reports line up with what is on screen.
@@ -424,6 +437,7 @@ end
 
 function M.stop(opts)
   opts = opts or {}
+  state.gen = state.gen + 1
   stop_timer()
   clear_highlight()
   ui.close()

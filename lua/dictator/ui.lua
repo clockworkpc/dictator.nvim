@@ -1,9 +1,9 @@
--- Floating transport panel for dictator.nvim.
+-- Transport panel for dictator.nvim.
 --
 -- The `dictate` CLI ships its own terminal TUI, but running that inside Neovim means
 -- pressing `i` to reach its keys and `<C-\><C-n>` to get back out. This draws the same
--- session state into an ordinary buffer in a float, so the transport controls are plain
--- normal-mode mappings and the window behaves like any other modal (Lazy, Mason, …).
+-- session state into an ordinary buffer, so the transport controls are plain normal-mode
+-- mappings — in a narrow right-hand split by default, or a float if one is preferred.
 
 local M = {}
 
@@ -12,10 +12,13 @@ local ns = vim.api.nvim_create_namespace("dictator_panel")
 local win, buf, actions
 
 local defaults = {
-  width = 76,
-  border = "rounded",
-  position = "center", -- center | top | bottom | top-right | bottom-right | top-left | bottom-left
-  cells = 24, -- progress bar width
+  -- A right-hand split gives the document the most usable width: the text reflows into
+  -- the remaining columns instead of hiding under an overlay. "float" is the same panel
+  -- in a floating window, for when a modal is wanted over the text.
+  style = "split", -- split | float
+  width = 0.25, -- a fraction of the editor, or an absolute number of columns
+  border = "rounded", -- float only
+  position = "top-right", -- float only: top-right | top-left | bottom-right | bottom | center | …
 }
 
 local opts = vim.deepcopy(defaults)
@@ -52,13 +55,11 @@ local keys = {
   { "Q", "stop" },
 }
 
+-- Key hints, one entry per line when the panel is too narrow for a single row
 local footer = {
-  { "p", "pause" },
-  { "h/l", "seek" },
-  { "[/]", "speed" },
-  { "r", "restart" },
-  { "q", "close" },
-  { "Q", "stop" },
+  { { "p", "pause" }, { "h/l", "seek" } },
+  { { "[/]", "speed" }, { "r", "restart" } },
+  { { "q", "close" }, { "Q", "stop" } },
 }
 
 -- ---------------------------------------------------------------- text helpers
@@ -135,10 +136,23 @@ local function ensure_hl()
   end
 end
 
-local function win_config()
-  local height = 8
-  local width = math.max(40, math.min(opts.width, vim.o.columns - 4))
-  local pos = opts.position or "center"
+-- Panel columns: a fraction of the editor (the document keeps the rest) or a count
+local function panel_width()
+  local w = opts.width or defaults.width
+  if w > 0 and w <= 1 then
+    w = math.floor(vim.o.columns * w)
+  end
+  -- a split also spends a column on the separator, so the document keeps its full share
+  if opts.style == "split" then
+    w = w - 1
+  end
+  return math.max(26, math.min(math.floor(w), vim.o.columns - 20))
+end
+
+local function win_config(height)
+  height = math.max(1, math.min(height or 14, vim.o.lines - 4))
+  local width = panel_width()
+  local pos = opts.position or defaults.position
   local row, col
 
   if pos:find("top") then
@@ -150,9 +164,9 @@ local function win_config()
   end
 
   if pos:find("right") then
-    col = math.max(0, vim.o.columns - width - 3)
+    col = math.max(0, vim.o.columns - width - 2)
   elseif pos:find("left") then
-    col = 2
+    col = 0
   else
     col = math.max(0, math.floor((vim.o.columns - width) / 2))
   end
@@ -200,9 +214,23 @@ function M.open(handlers, config)
   vim.bo[buf].bufhidden = "wipe"
   vim.bo[buf].filetype = "dictator"
   vim.bo[buf].modifiable = false
+  pcall(vim.api.nvim_buf_set_name, buf, "dictate")
 
-  win = vim.api.nvim_open_win(buf, true, win_config())
-  vim.wo[win].winhighlight = "NormalFloat:NormalFloat,FloatBorder:FloatBorder"
+  if opts.style == "split" then
+    vim.cmd("botright vsplit")
+    win = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(win, buf)
+    vim.api.nvim_win_set_width(win, panel_width())
+    vim.wo[win].winfixwidth = true
+    vim.wo[win].number = false
+    vim.wo[win].relativenumber = false
+    vim.wo[win].signcolumn = "no"
+    vim.wo[win].foldcolumn = "0"
+  else
+    -- a narrow panel needs the taller layout, corrected on the first render
+    win = vim.api.nvim_open_win(buf, true, win_config(panel_width() - 4 < 56 and 14 or 8))
+    vim.wo[win].winhighlight = "NormalFloat:NormalFloat,FloatBorder:FloatBorder"
+  end
   vim.wo[win].wrap = false
   vim.wo[win].cursorline = false
 
@@ -224,8 +252,13 @@ function M.open(handlers, config)
   vim.api.nvim_create_autocmd("VimResized", {
     group = group,
     callback = function()
-      if M.is_open() then
-        vim.api.nvim_win_set_config(win, win_config())
+      if not M.is_open() then
+        return
+      end
+      if opts.style == "split" then
+        vim.api.nvim_win_set_width(win, panel_width())
+      else
+        vim.api.nvim_win_set_config(win, win_config(vim.api.nvim_win_get_height(win)))
       end
     end,
   })
@@ -249,53 +282,108 @@ local icons = {
   done = { "■", "DictatorDone" },
 }
 
+local pad = "  "
+
+local function bar(frac, cells)
+  local filled = math.floor(math.min(math.max(frac or 0, 0), 1) * cells + 0.5)
+  return string.rep("█", filled), string.rep("░", cells - filled)
+end
+
+-- The panel is meant to be narrow — the document keeps the rest of the screen — so the
+-- layout folds: header, transport line, current text, key hints, each split over more
+-- lines as the columns run out.
+local function layout(info, inner)
+  local lines = {}
+  local function add(l)
+    lines[#lines + 1] = l
+    return l
+  end
+
+  local icon = icons[info.state] or { "■", "DictatorStopped" }
+  local eta = "~" .. fmt_hms(info.left)
+  local chunk = string.format("chunk %d/%d", info.idx + 1, info.total)
+  local pct = string.format("%d%%", info.percent)
+  local speed = "speed " .. info.speed
+
+  if inner >= 56 then
+    local head = line():add(pad):add("dictate", "DictatorTitle")
+    if info.title ~= "" then
+      head:add(" ── ", "DictatorMeta"):add(info.title, "DictatorMeta")
+    end
+    if info.voice ~= "" then
+      head:add(" ── ", "DictatorMeta"):add(info.voice, "DictatorMeta")
+    end
+    add(head)
+    add(line())
+
+    local fill, rest = bar(info.frac, math.max(8, math.min(24, inner - 44)))
+    add(line():add(pad):add(icon[1], icon[2]):add("  " .. chunk .. "  "):add(fill, "DictatorBar")
+      :add(rest, "DictatorBarEmpty"):add(("  %s  %s left  %s"):format(pct, eta, speed)))
+    add(line())
+    for _, text in ipairs(wrap(info.text, inner, 2)) do
+      add(text ~= "" and line():add(pad):add(text, "DictatorText") or line())
+    end
+    add(line())
+
+    local help = line():add(pad)
+    for _, row in ipairs(footer) do
+      for _, k in ipairs(row) do
+        help:add(help.text == pad and "" or "  "):add(k[1], "DictatorKey"):add(" " .. k[2], "DictatorKeyDesc")
+      end
+    end
+    add(help)
+  else
+    add(line():add(pad):add("dictate", "DictatorTitle"))
+    if info.title ~= "" then
+      add(line():add(pad):add(truncate(info.title, inner), "DictatorMeta"))
+    end
+    if info.voice ~= "" then
+      add(line():add(pad):add(truncate(info.voice, inner), "DictatorMeta"))
+    end
+    add(line())
+
+    local transport = line():add(pad):add(icon[1], icon[2]):add("  " .. chunk .. "  " .. pct)
+    if inner >= #chunk + #pct + 16 then
+      transport:add("  " .. speed)
+    end
+    add(transport)
+    local fill, rest = bar(info.frac, math.max(8, inner - #eta - 2))
+    add(line():add(pad):add(fill, "DictatorBar"):add(rest, "DictatorBarEmpty"):add("  " .. eta))
+    if not transport.text:find("speed") then
+      add(line():add(pad):add(speed))
+    end
+    add(line())
+
+    for _, text in ipairs(wrap(info.text, inner, 3)) do
+      add(text ~= "" and line():add(pad):add(text, "DictatorText") or line())
+    end
+    add(line())
+
+    for _, row in ipairs(footer) do
+      local help = line():add(pad)
+      for _, k in ipairs(row) do
+        help:add(help.text == pad and "" or "  "):add(k[1], "DictatorKey"):add(" " .. k[2], "DictatorKeyDesc")
+      end
+      add(help)
+    end
+  end
+
+  for _, l in ipairs(lines) do
+    l.text = truncate(l.text, inner + 2)
+  end
+  return lines
+end
+
 -- info = { state, title, voice, idx, total, percent, frac, left, speed, text }
 function M.render(info)
   if not M.is_open() then
     return
   end
-  local width = vim.api.nvim_win_get_width(win)
-  local inner = width - 4 -- two columns of padding either side
-  local pad = "  "
-  local rendered = {}
+  local rendered = layout(info, vim.api.nvim_win_get_width(win) - 4)
 
-  local head = line():add(pad):add("dictate", "DictatorTitle")
-  if info.title ~= "" then
-    head:add(" ── ", "DictatorMeta"):add(truncate(info.title, inner - 12), "DictatorMeta")
+  if opts.style ~= "split" and vim.api.nvim_win_get_height(win) ~= #rendered then
+    vim.api.nvim_win_set_config(win, win_config(#rendered))
   end
-  if info.voice ~= "" then
-    head:add(" ── ", "DictatorMeta"):add(info.voice, "DictatorMeta")
-  end
-  head.text = truncate(head.text, width - 2)
-  rendered[1] = head
-  rendered[2] = line()
-
-  local icon = icons[info.state] or { "■", "DictatorStopped" }
-  local cells = math.max(8, math.min(opts.cells, inner - 44))
-  local filled = math.floor(math.min(math.max(info.frac or 0, 0), 1) * cells + 0.5)
-  local status = line():add(pad):add(icon[1], icon[2])
-  status:add(string.format("  chunk %d/%d  ", info.idx + 1, info.total))
-  status:add(string.rep("█", filled), "DictatorBar")
-  status:add(string.rep("░", cells - filled), "DictatorBarEmpty")
-  status:add(string.format("  %d%%  ~%s left  speed %s", info.percent, fmt_hms(info.left), info.speed))
-  status.text = truncate(status.text, width - 2)
-  rendered[3] = status
-  rendered[4] = line()
-
-  for i, text in ipairs(wrap(info.text, inner, 2)) do
-    rendered[4 + i] = text ~= "" and line():add(pad):add(text, "DictatorText") or line()
-  end
-  rendered[7] = line()
-
-  local help = line():add(pad)
-  for i, k in ipairs(footer) do
-    if i > 1 then
-      help:add("  ")
-    end
-    help:add(k[1], "DictatorKey"):add(" " .. k[2], "DictatorKeyDesc")
-  end
-  help.text = truncate(help.text, width - 2)
-  rendered[8] = help
 
   local text = {}
   for i, l in ipairs(rendered) do

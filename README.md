@@ -40,9 +40,11 @@ its own (transport controls, WM hotkeys), and the plugin is a thin layer over it
 }
 ```
 
-Open a markdown file and run `:DictatorStart`. The scrubber appears in a floating panel —
-an ordinary buffer, not a terminal, so its keys are plain normal-mode mappings with no
-`i` / `<C-\><C-n>` dance — and the line being read is highlighted as playback moves.
+Open a markdown file and run `:DictatorStart`. The scrubber appears in a narrow panel on
+the right — an ordinary buffer, not a terminal, so its keys are plain normal-mode mappings
+with no `i` / `<C-\><C-n>` dance — and the line being read is highlighted as playback
+moves. It takes a quarter of the screen and the document keeps the rest; the layout folds
+itself to fit whatever width it is given.
 
 | Key | Effect |
 | --- | --- |
@@ -74,9 +76,10 @@ require("dictator").setup({
   cmd = "dictate",                  -- CLI name or absolute path
   voice = nil, speed = nil,         -- nil = the CLI defaults (alan, 0.7)
   win = {                           -- the transport panel
-    width = 76,
-    border = "rounded",             -- any nvim_open_win() border
-    position = "center",            -- center | top | bottom | top-right | bottom-right | …
+    style = "split",                -- "split" (right-hand) or "float"
+    width = 0.25,                   -- a fraction of the editor, or a column count
+    border = "rounded",             -- float only: any nvim_open_win() border
+    position = "top-right",         -- float only: top-right | bottom-right | center | …
   },
   filetypes = { markdown = true },  -- set to nil to allow any buffer
   follow = true,                    -- keep the read line in view
@@ -84,10 +87,14 @@ require("dictator").setup({
 })
 ```
 
-The panel is 8 rows tall and centred like Lazy's; `position = "top-right"` tucks it into a
-corner instead, which keeps the whole document visible while it reads. Its own highlights
-(`DictatorTitle`, `DictatorBar`, `DictatorKey`, …) link to sensible defaults and can be
-overridden.
+A split is the default because it gives the text the most usable width: the document
+reflows into the remaining columns rather than hiding under an overlay. `style = "float"`
+draws the same panel as a modal instead, tucked into the top-right corner, which does
+cover whatever is behind it. Either way it takes ~25% of the screen, and below about 56
+columns the panel folds its header, progress bar and key hints onto separate lines.
+
+Its highlights (`DictatorTitle`, `DictatorBar`, `DictatorKey`, …) link to sensible
+defaults and can be overridden.
 
 The buffer is read as it currently stands, unsaved changes included, so the highlighted
 line always matches what is on screen. `:DictatorJump` maps a buffer line to the chunk
