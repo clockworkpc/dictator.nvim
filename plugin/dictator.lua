@@ -16,7 +16,11 @@ end, { nargs = "*", desc = "Read the current markdown buffer aloud" })
 
 command("DictatorStop", function()
   dictator().stop()
-end, { desc = "Stop reading and close the playback split" })
+end, { desc = "Stop reading and close the transport panel" })
+
+command("DictatorPanel", function()
+  dictator().panel()
+end, { desc = "Open (or focus) the floating transport panel" })
 
 command("DictatorToggle", function()
   dictator().toggle()

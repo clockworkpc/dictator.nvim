@@ -11,7 +11,7 @@ or you could have it read aloud to you, with a scrubber that follows along in th
 ---
 
 Read a markdown buffer aloud with [Piper](https://github.com/OHF-Voice/piper1-gpl) TTS,
-following along in the text: the playback scrubber opens in a vertical split and the line
+following along in the text: the playback scrubber opens in a floating panel and the line
 being read is highlighted in the original buffer.
 
 It is two pieces — a Neovim plugin, and the `dictate` CLI it drives. The CLI is useful on
@@ -40,17 +40,31 @@ its own (transport controls, WM hotkeys), and the plugin is a thin layer over it
 }
 ```
 
-Open a markdown file and run `:DictatorStart`. The scrubber appears in a vertical split,
-focus stays in your text, and the line being read is highlighted as playback moves.
+Open a markdown file and run `:DictatorStart`. The scrubber appears in a floating panel —
+an ordinary buffer, not a terminal, so its keys are plain normal-mode mappings with no
+`i` / `<C-\><C-n>` dance — and the line being read is highlighted as playback moves.
+
+| Key | Effect |
+| --- | --- |
+| `p` | Pause / resume |
+| `h` `l` (or `←` `→`) | Seek a chunk back / forward |
+| `[` `]` (or `↓` `↑`) | Slower / faster |
+| `r` | Restart the current chunk |
+| `q` / `<Esc>` | Close the panel, keep reading |
+| `Q` | Stop reading and close |
+
+Closing the panel leaves playback running and the buffer still following along;
+`:DictatorPanel` brings it back.
 
 | Command | Effect |
 | --- | --- |
 | `:DictatorStart [voice] [speed]` | Read the current buffer, unsaved edits included |
+| `:DictatorPanel` | Open (or focus) the transport panel |
 | `:DictatorToggle` | Pause / resume |
 | `:DictatorSpeed {N\|+N\|-N}` | Set or nudge speed (length scale, lower = faster) |
 | `:DictatorJump [line]` | Jump playback to a buffer line — cursor line by default, or `:89DictatorJump` |
 | `:DictatorSeek {N\|+N\|-N}` | Seek by chunk |
-| `:DictatorStop` | Stop and close the split |
+| `:DictatorStop` | Stop and close the panel |
 | `:DictatorStatus` | Status in a notification |
 
 Options, shown with their defaults:
@@ -59,12 +73,21 @@ Options, shown with their defaults:
 require("dictator").setup({
   cmd = "dictate",                  -- CLI name or absolute path
   voice = nil, speed = nil,         -- nil = the CLI defaults (alan, 0.7)
-  split = "vsplit", width = 52,     -- the scrubber window
+  win = {                           -- the transport panel
+    width = 76,
+    border = "rounded",             -- any nvim_open_win() border
+    position = "center",            -- center | top | bottom | top-right | bottom-right | …
+  },
   filetypes = { markdown = true },  -- set to nil to allow any buffer
   follow = true,                    -- keep the read line in view
   hl_group = "DictatorLine",        -- links to Visual unless you define it
 })
 ```
+
+The panel is 8 rows tall and centred like Lazy's; `position = "top-right"` tucks it into a
+corner instead, which keeps the whole document visible while it reads. Its own highlights
+(`DictatorTitle`, `DictatorBar`, `DictatorKey`, …) link to sensible defaults and can be
+overridden.
 
 The buffer is read as it currently stands, unsaved changes included, so the highlighted
 line always matches what is on screen. `:DictatorJump` maps a buffer line to the chunk

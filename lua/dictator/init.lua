@@ -1,8 +1,11 @@
 -- dictator.nvim - read the current markdown buffer aloud, following along in the buffer.
 --
 -- The heavy lifting lives in the `dictate` CLI: it chunks the markdown, synthesizes it
--- with Piper, and exposes a session as plain state files. This module opens the CLI's
--- TUI in a vertical split, polls that state, and highlights the source line being read.
+-- with Piper, and exposes a session as plain state files. This module starts the CLI
+-- detached, polls that state into a floating transport panel, and highlights the source
+-- line being read.
+
+local ui = require("dictator.ui")
 
 local M = {}
 
@@ -10,8 +13,11 @@ local config = {
   cmd = "dictate", -- CLI on PATH, or an absolute path
   voice = nil, -- nil = the CLI default (alan)
   speed = nil, -- nil = the CLI default (0.7)
-  split = "vsplit", -- how the TUI window is opened
-  width = 52, -- columns for the TUI split
+  win = { -- the floating transport panel
+    width = 76,
+    border = "rounded",
+    position = "center", -- center | top | bottom | top-right | bottom-right | …
+  },
   filetypes = { markdown = true }, -- set to nil to allow any buffer
   follow = true, -- scroll the source window to keep the read line visible
   poll_ms = 150,
@@ -22,11 +28,11 @@ local config = {
 local state = {
   src_buf = nil, -- buffer being read
   src_win = nil, -- window showing it
-  tui_buf = nil, -- terminal buffer running `dictate tui`
-  tui_win = nil,
   timer = nil,
   rundir = nil,
   lines = nil, -- chunk index (0-based) -> source line
+  sizes = nil, -- chunk index (0-based) -> character count
+  chunk = nil, -- { idx, text } cache for the panel
   last_idx = nil,
   tmpfile = nil,
   tmpdir = nil,
@@ -61,6 +67,10 @@ local function read_value(name)
   return (data:gsub("%s+$", ""))
 end
 
+local function read_number(name, fallback)
+  return tonumber(read_value(name) or "") or fallback
+end
+
 -- Run the CLI without blocking the editor. `args` is a list.
 local function cli(args, on_exit)
   local cmd = vim.list_extend({ config.cmd }, args)
@@ -82,6 +92,11 @@ local function cli_sync(args)
     return nil
   end
   return (out:gsub("%s+$", ""))
+end
+
+local function now()
+  local secs, usecs = vim.loop.gettimeofday()
+  return secs + usecs / 1e6
 end
 
 -- ---------------------------------------------------------------- highlight
@@ -136,6 +151,76 @@ local function load_line_map()
   return map
 end
 
+-- chunk index (0-based) -> characters, from the CLI's `sizes` file
+local function load_sizes()
+  local data = read_file(state.rundir .. "/sizes")
+  if not data then
+    return nil
+  end
+  local sizes, total = {}, 0
+  local i = 0
+  for n in data:gmatch("[^\n]+") do
+    sizes[i] = tonumber(n) or 0
+    total = total + sizes[i]
+    i = i + 1
+  end
+  sizes.total = total
+  return sizes
+end
+
+local function chunk_text(idx)
+  if state.chunk and state.chunk.idx == idx then
+    return state.chunk.text
+  end
+  local data = read_file(string.format("%s/chunks/%04d.txt", state.rundir, idx)) or ""
+  local text = data:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+  state.chunk = { idx = idx, text = text }
+  return text
+end
+
+-- Everything the panel draws, derived from the CLI's state files. Progress is
+-- character-weighted, with the within-chunk fraction taken from how far into the
+-- current wav's duration we are — the same arithmetic as the CLI's own TUI.
+local function session_info()
+  local st = read_value("state") or "none"
+  local idx = read_number("idx", 0)
+  local dur = read_number("dur", 0)
+  local started = read_number("started", 0)
+  local acc = read_number("paused_acc", 0)
+  local paused_at = read_number("paused_at", 0)
+
+  state.sizes = state.sizes or load_sizes()
+  local sizes = state.sizes or {}
+  local all = sizes.total or 0
+
+  local elapsed = 0
+  if started > 0 then
+    local ref = (st == "paused" and paused_at > 0) and paused_at or now()
+    elapsed = math.max(0, ref - started - acc)
+  end
+
+  local done = 0
+  for i = 0, idx - 1 do
+    done = done + (sizes[i] or 0)
+  end
+  local cur = sizes[idx] or 0
+  local frac = dur > 0 and math.min(elapsed / dur, 1) or 0
+  local done_now = done + cur * frac
+
+  return {
+    state = st,
+    idx = idx,
+    total = read_number("total", 0),
+    speed = read_value("speed") or "",
+    title = read_value("title") or "",
+    voice = read_value("voice") or "",
+    percent = all > 0 and math.floor(done_now * 100 / all) or 0,
+    frac = all > 0 and done_now / all or 0,
+    left = (dur > 0 and cur > 0) and (all - done_now) * (dur / cur) or -1,
+    text = chunk_text(idx),
+  }
+end
+
 local function stop_timer()
   if state.timer then
     state.timer:stop()
@@ -144,41 +229,106 @@ local function stop_timer()
   end
 end
 
-local function tick()
-  local session_state = read_value("state")
-  if not session_state or session_state == "stopped" or session_state == "none" then
-    vim.schedule(function()
-      M.stop({ keep_window = true })
-    end)
-    return
-  end
-
-  local idx = tonumber(read_value("idx") or "")
-  if not idx or idx == state.last_idx then
-    if session_state == "done" then
-      vim.schedule(function()
-        M.stop({ keep_window = true })
-      end)
-    end
+local function follow(idx)
+  if idx == state.last_idx then
     return
   end
   state.last_idx = idx
-
-  if not state.lines then
-    state.lines = load_line_map()
-  end
+  state.lines = state.lines or load_line_map()
   local line = state.lines and state.lines[idx]
   if line and line > 0 then
-    vim.schedule(function()
-      highlight_line(line)
-    end)
+    highlight_line(line)
+  end
+end
+
+-- One poll: follow the read line, redraw the panel, and notice a finished session.
+local function update()
+  if not state.rundir then
+    return
+  end
+  local info = session_info()
+
+  if info.state == "none" or info.state == "stopped" then
+    M.stop({ keep_session = true })
+    return
+  end
+
+  follow(info.idx)
+  ui.render(info)
+
+  if info.state == "done" then
+    stop_timer()
+    vim.defer_fn(function()
+      M.stop({ keep_session = true })
+    end, 1500)
   end
 end
 
 local function start_timer()
   stop_timer()
   state.timer = vim.loop.new_timer()
-  state.timer:start(200, config.poll_ms, tick)
+  state.timer:start(100, config.poll_ms, function()
+    vim.schedule(update)
+  end)
+end
+
+-- Redraw sooner than the next poll, once the CLI has had a moment to act
+local function refresh()
+  vim.defer_fn(function()
+    if state.rundir then
+      update()
+    end
+  end, 80)
+end
+
+-- ---------------------------------------------------------------- panel
+
+local function actions()
+  return {
+    toggle = function()
+      M.toggle()
+      refresh()
+    end,
+    next = function()
+      M.seek("+1")
+      refresh()
+    end,
+    prev = function()
+      M.seek("-1")
+      refresh()
+    end,
+    faster = function()
+      M.speed("-0.05")
+      refresh()
+    end,
+    slower = function()
+      M.speed("+0.05")
+      refresh()
+    end,
+    restart = function()
+      M.seek(tostring(read_number("idx", 0)))
+      refresh()
+    end,
+    close = function()
+      ui.close()
+    end,
+    stop = function()
+      M.stop()
+    end,
+  }
+end
+
+-- Open (or focus) the transport panel for the running session.
+function M.panel()
+  if not state.rundir then
+    state.rundir = cli_sync({ "rundir" })
+  end
+  if not state.rundir or (read_value("state") or "none") == "none" then
+    notify("no session running", vim.log.levels.WARN)
+    return
+  end
+  ui.open(actions(), config.win)
+  update()
 end
 
 -- ---------------------------------------------------------------- commands
@@ -211,7 +361,7 @@ function M.start(opts)
 
   -- Read the buffer as it is now, unsaved edits included, so the line numbers the CLI
   -- reports line up with what is on screen.
-  -- Keep the real filename inside a temp directory, so the TUI header names the
+  -- Keep the real filename inside a temp directory, so the panel header names the
   -- document rather than a scratch path
   local name = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(buf), ":t")
   if name == "" then
@@ -225,7 +375,7 @@ function M.start(opts)
   state.src_buf = buf
   state.src_win = vim.api.nvim_get_current_win()
   state.last_idx = nil
-  state.lines = nil
+  state.lines, state.sizes, state.chunk = nil, nil, nil
 
   state.rundir = cli_sync({ "rundir" })
   if not state.rundir then
@@ -235,7 +385,9 @@ function M.start(opts)
 
   local voice = opts.voice or config.voice
   local speed = opts.speed or config.speed
-  local args = { config.cmd, state.tmpfile }
+  -- -b starts the session detached and returns as soon as the daemon is up: no terminal,
+  -- so the transport panel can be an ordinary buffer
+  local args = { "-b", state.tmpfile }
   -- The CLI takes VOICE before SPEED positionally, so a speed alone still needs a voice
   if speed and not voice then
     voice = "alan"
@@ -249,53 +401,42 @@ function M.start(opts)
 
   ensure_hl()
 
-  vim.cmd(config.split)
-  state.tui_win = vim.api.nvim_get_current_win()
-  vim.api.nvim_win_set_width(state.tui_win, config.width)
-  -- termopen takes over the *current* buffer. The split still shows the document, so
-  -- give the window a scratch buffer first or the document buffer becomes the terminal.
-  local scratch = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_win_set_buf(state.tui_win, scratch)
-  vim.fn.termopen(args, {
-    on_exit = function()
+  local errors = {}
+  vim.fn.jobstart(vim.list_extend({ config.cmd }, args), {
+    stderr_buffered = true,
+    on_stderr = function(_, data)
+      errors = data or {}
+    end,
+    on_exit = function(_, code)
       vim.schedule(function()
-        M.stop({ keep_window = true })
+        if code ~= 0 then
+          local msg = vim.trim(table.concat(errors, " "))
+          notify(msg ~= "" and msg or ("'" .. config.cmd .. "' exited with " .. code), vim.log.levels.ERROR)
+          M.stop({ keep_session = true })
+          return
+        end
+        ui.open(actions(), config.win)
+        start_timer()
       end)
     end,
   })
-  state.tui_buf = vim.api.nvim_get_current_buf()
-  vim.bo[state.tui_buf].buflisted = false
-  vim.wo[state.tui_win].number = false
-  vim.wo[state.tui_win].relativenumber = false
-  vim.wo[state.tui_win].signcolumn = "no"
-  vim.wo[state.tui_win].winfixwidth = true
-
-  -- Hand focus back to the text being read
-  if vim.api.nvim_win_is_valid(state.src_win) then
-    vim.api.nvim_set_current_win(state.src_win)
-  end
-
-  start_timer()
 end
 
 function M.stop(opts)
   opts = opts or {}
   stop_timer()
   clear_highlight()
+  ui.close()
 
   if not opts.keep_session then
     cli({ "stop" })
   end
 
-  if not opts.keep_window and state.tui_win and vim.api.nvim_win_is_valid(state.tui_win) then
-    vim.api.nvim_win_close(state.tui_win, true)
-  end
   if state.tmpdir then
     vim.fn.delete(state.tmpdir, "rf")
     state.tmpdir, state.tmpfile = nil, nil
   end
-  state.tui_win, state.tui_buf = nil, nil
-  state.lines, state.last_idx = nil, nil
+  state.lines, state.sizes, state.chunk, state.last_idx = nil, nil, nil, nil
 end
 
 function M.toggle()
@@ -311,6 +452,7 @@ function M.speed(arg)
 end
 
 function M.seek(arg)
+  state.last_idx = nil -- force the highlight to refresh
   cli({ "seek", arg })
 end
 
@@ -332,8 +474,7 @@ function M.jump(line)
     notify("no chunk covers line " .. line, vim.log.levels.WARN)
     return
   end
-  state.last_idx = nil -- force the highlight to refresh
-  cli({ "seek", tostring(best) })
+  M.seek(tostring(best))
 end
 
 function M.status()
