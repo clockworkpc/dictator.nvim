@@ -20,7 +20,8 @@ git clone <this repo> ~/Development/dictate
 ln -sfn ~/Development/dictate/dictate ~/.local/bin/dictate
 ```
 
-Requires `piper-tts` and `pw-play` on PATH, plus `jq` and `awk`. `fzf` is needed only
+Requires `piper-tts` and `pw-play` on PATH, plus `jq` and `awk`. `sox` generates the
+list-item chime (a shipped asset is used if it is missing), and `fzf` is needed only
 for the `-i` voice picker. On Arch: `piper-tts-bin`, `piper-voices-en-gb`, `pipewire`.
 
 ## Usage
@@ -137,6 +138,17 @@ reads as:
 > scheduled-jobs dashboard (Turbo Streams), Per-domain stop control and manual
 > re-validation.
 
+Each item also starts its own chunk, marked by a soft chime — an 880 Hz sine, 280 ms,
+faded in and out at -20 dBFS, so it sits well under the voice and tells you a new item
+has begun without interrupting the reading. Because each item is its own chunk, seek
+steps item by item through a list.
+
+The chime is generated with `sox` at the voice's own sample rate; if `sox` is missing or
+fails, `assets/chime-soft-22050.wav` is used instead, and if neither is available the
+chime is simply skipped. `DICTATE_CHIME=off` disables it, `DICTATE_CHIME_DB=-14` makes
+it more present. `demo/make_demo.sh` regenerates the demo and offers `bell` and `pluck`
+alternatives.
+
 Wrapped items are folded into one item before punctuating, so the comma lands at the end
 rather than mid-sentence. Blank lines between items still count as one list, and nested
 items are treated as continuing the list. Applies to `-`, `*`, and `+` bullets; numbered
@@ -177,3 +189,5 @@ seconds-per-character rather than a guess.
 | `DICTATE_CHUNK_CHARS`  | `320`                    | Target chunk size; also seek granularity |
 | `DICTATE_PLAYER`       | `pw-play`                | Player command (`paplay`, `aplay`) |
 | `DICTATE_RUN_DIR`      | `/run/user/$UID/dictate` | Session state dir; override to run isolated sessions |
+| `DICTATE_CHIME`        | `on`                     | `off` disables the list-item chime |
+| `DICTATE_CHIME_DB`     | `-20`                    | Chime peak in dBFS; less negative = more present |

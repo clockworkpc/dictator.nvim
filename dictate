@@ -129,11 +129,33 @@ expand_markup() {
           j = k
           while (j <= NR && trim(L[j]) == "") j++
           if (t != "" && t !~ /[.,;:!?]$/) t = t ((j <= NR && is_item(L[j])) ? "," : ".")
-          print t
+          # \001 marks an item start: the chunker breaks there and the chime is
+          # prepended to that chunk at synthesis
+          print "\001" t
           i = k
         } else { print L[i]; i++ }
       }
     }'
+}
+
+# A soft 880 Hz sine, 280 ms, faded in and out and kept well under the voice, marking
+# the start of each list item. Generated at the voice's own sample rate so it can be
+# concatenated with the synthesized speech; falls back to the shipped asset if sox is
+# unavailable, and is skipped entirely if neither works.
+make_chime() { # make_chime RATE
+  local rate="$1" level="${DICTATE_CHIME_DB:--20}" asset
+  [[ "${DICTATE_CHIME:-on}" == off ]] && return 0
+  if command -v sox >/dev/null &&
+     sox -n -r "$rate" -c 1 "$S/chime.tmp.wav" \
+         synth 0.28 sine 880 fade h 0.004 0.28 0.26 gain -n "$level" 2>/dev/null &&
+     sox "$S/chime.tmp.wav" "$S/chime.wav" pad 0 0.12 2>/dev/null; then
+    rm -f "$S/chime.tmp.wav"
+    return 0
+  fi
+  rm -f "$S/chime.tmp.wav"
+  asset="$(dirname "$(readlink -f "$0")")/assets/chime-soft-22050.wav"
+  [[ "$rate" == 22050 && -f "$asset" ]] && cp "$asset" "$S/chime.wav"
+  return 0
 }
 
 build_chunks() { # build_chunks INPUT -> prints "TOTAL CHARS"
@@ -145,19 +167,22 @@ build_chunks() { # build_chunks INPUT -> prints "TOTAL CHARS"
               s/^[[:space:]]*#+[[:space:]]*//
               s/^[[:space:]]*>+[[:space:]]*//
               s/[*`|]//g; s/_/ /g' \
-    | awk -v dir="$S/chunks" -v sizes="$S/sizes" -v max="$CHUNK_CHARS" '
+    | awk -v dir="$S/chunks" -v sizes="$S/sizes" -v marks="$S/marks" -v max="$CHUNK_CHARS" '
         function flush(  f) {
           if (buf == "") return
           f = sprintf("%s/%04d.txt", dir, n)
           print buf > f; close(f)
           print length(buf) > sizes
+          print mark > marks           # 1 = chunk opens a list item, so chime it
+          mark = 0                     # a long item spilling over does not re-chime
           total += length(buf); n++
           buf = ""
         }
-        BEGIN { n = 0; buf = ""; total = 0; printf "" > sizes }
+        BEGIN { n = 0; buf = ""; total = 0; mark = 0; printf "" > sizes; printf "" > marks }
         /^[[:space:]]*$/ { flush(); next }
         {
           gsub(/\r/, "")
+          if (index($0, "\001") == 1) { flush(); mark = 1; sub(/\001/, "") }
           k = split($0, w, /[[:space:]]+/)
           for (i = 1; i <= k; i++) {
             if (w[i] == "") continue
@@ -173,8 +198,15 @@ build_chunks() { # build_chunks INPUT -> prints "TOTAL CHARS"
 
 wav_for() { printf '%s/wav/%04d-%s.wav' "$S" "$1" "$2"; }
 
+chime_for() { # chime_for IDX -> path of the chime to prepend, empty if none
+  local idx="$1" mark
+  [[ -s "$S/chime.wav" && -f "$S/marks" ]] || return 0
+  mark="$(awk -v n=$((idx+1)) 'NR==n {print; exit}' "$S/marks")"
+  [[ "$mark" == 1 ]] && printf '%s' "$S/chime.wav"
+}
+
 synth() { # synth IDX SPEED  (idempotent, atomic)
-  local idx="$1" speed="$2" out chunk tmp model
+  local idx="$1" speed="$2" out chunk tmp model chime
   out="$(wav_for "$idx" "$speed")"
   [[ -s "$out" ]] && return 0
   chunk="$(printf '%s/chunks/%04d.txt' "$S" "$idx")"
@@ -182,7 +214,12 @@ synth() { # synth IDX SPEED  (idempotent, atomic)
   model="$(sget model)"
   tmp="$out.$$.tmp"
   if piper-tts -q -m "$model" --length_scale "$speed" -f "$tmp" <"$chunk" 2>/dev/null && [[ -s "$tmp" ]]; then
-    mv -f "$tmp" "$out"
+    chime="$(chime_for "$idx")"
+    if [[ -n "$chime" ]] && sox "$chime" "$tmp" "$tmp.c" 2>/dev/null && [[ -s "$tmp.c" ]]; then
+      mv -f "$tmp.c" "$out"; rm -f "$tmp"
+    else
+      rm -f "$tmp.c"; mv -f "$tmp" "$out"
+    fi
   else
     rm -f "$tmp"; return 1
   fi
@@ -468,6 +505,7 @@ start() {
   sput model "$model"
   sput voice "$voice"
   sput rate "$(jq -r '.audio.sample_rate // 22050' "$model.json" 2>/dev/null || echo 22050)"
+  make_chime "$(sget rate 22050)"
   sput speed "$speed"
   sput idx 0
   sput total "$total"
