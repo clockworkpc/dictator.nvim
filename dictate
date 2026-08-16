@@ -120,7 +120,11 @@ build_chunks() { # build_chunks INPUT -> prints "TOTAL CHARS"
   local input="$1"
   mkdir -p "$S/chunks" "$S/wav"
   expand_tables <"$input" \
-    | sed -E 's/\[([^]]*)\]\([^)]*\)/\1/g; s/[#*`>|]//g; s/_/ /g' \
+    | sed -E 's/<!--.*-->//g; s#</?[a-zA-Z][^>]*>##g' \
+    | sed -E 's/\[([^]]*)\]\([^)]*\)/\1/g
+              s/^[[:space:]]*#+[[:space:]]*//
+              s/^[[:space:]]*>+[[:space:]]*//
+              s/[*`|]//g; s/_/ /g' \
     | awk -v dir="$S/chunks" -v sizes="$S/sizes" -v max="$CHUNK_CHARS" '
         function flush(  f) {
           if (buf == "") return

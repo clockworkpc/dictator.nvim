@@ -119,6 +119,13 @@ cells than headers falls back to "Column N".
 Underscores become spaces rather than being deleted, so `domain_name` reads as
 "domain name" instead of "domainname".
 
+### Markup that is skipped
+
+Raw HTML is dropped, so print scaffolding like
+`<div style="page-break-before: always;"></div>` is silent rather than spelled out;
+inline tags and `<!-- comments -->` go too. Heading `#` and blockquote `>` markers are
+only stripped at the start of a line, so `C#`, `#1`, and `a > b` survive intact.
+
 ### Everything else
 
 The input is markdown-stripped, split into ~320-character chunks on sentence and
