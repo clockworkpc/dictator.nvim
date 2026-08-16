@@ -94,6 +94,33 @@ notification.
 
 ## How it works
 
+### Tables
+
+Markdown tables are unreadable read straight through, so each row is rewritten as
+labelled sentences — the column header before each cell — and each row becomes its own
+paragraph:
+
+```
+| Area            | Current Implementation                    | Why It Matters                  |
+|-----------------|-------------------------------------------|---------------------------------|
+| **Data entry**  | Typed into a Google Sheet                 | Fewer copy-paste mistakes       |
+```
+
+reads as:
+
+> Area: Data entry. Current Implementation: Typed into a Google Sheet. Why It Matters:
+> Fewer copy-paste mistakes.
+
+Cells get a sentence-final period, so piper's `--sentence_silence` gives a short pause
+between fields, and the paragraph break puts a longer pause between rows. Bold, code
+ticks, and alignment colons are stripped; empty cells are skipped; a row with more
+cells than headers falls back to "Column N".
+
+Underscores become spaces rather than being deleted, so `domain_name` reads as
+"domain name" instead of "domainname".
+
+### Everything else
+
 The input is markdown-stripped, split into ~320-character chunks on sentence and
 paragraph boundaries, and synthesized one chunk at a time with `piper-tts`, played
 through `pw-play`. The next chunk is synthesized while the current one plays, so gaps

@@ -77,10 +77,50 @@ wav_secs() { # 16-bit mono wav duration from size
 
 # ---------------------------------------------------------------- text chunking
 
+# Rewrite markdown tables as "Header: cell." sentences, one row per paragraph, so a
+# row reads as labelled fields with a pause between rows. Must run before the markdown
+# strip below, which deletes the '|' that delimits the cells.
+expand_tables() {
+  awk '
+    function trim(s) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s }
+    function clean(s) { gsub(/\*\*|__|`/, "", s); return trim(s) }
+    function is_sep(l) { return (l ~ /\|/ && l ~ /-/ && l ~ /^[[:space:]]*\|?[[:space:]:|-]+$/) }
+    function split_row(l, arr,   k, i) {
+      sub(/^[[:space:]]*\|/, "", l); sub(/\|[[:space:]]*$/, "", l)
+      k = split(l, arr, /\|/)
+      for (i = 1; i <= k; i++) arr[i] = clean(arr[i])
+      return k
+    }
+    { L[NR] = $0 }
+    END {
+      i = 1
+      while (i <= NR) {
+        if (L[i] ~ /\|/ && i < NR && is_sep(L[i+1])) {
+          nh = split_row(L[i], H)
+          i += 2
+          while (i <= NR && L[i] ~ /\|/ && trim(L[i]) != "") {
+            nc = split_row(L[i], C)
+            print ""
+            for (j = 1; j <= nc; j++) {
+              if (C[j] == "") continue
+              h = (j <= nh && H[j] != "") ? H[j] : ("Column " j)
+              c = C[j]
+              if (c !~ /[.!?:;]$/) c = c "."
+              print h ": " c
+            }
+            print ""
+            i++
+          }
+        } else { print L[i]; i++ }
+      }
+    }'
+}
+
 build_chunks() { # build_chunks INPUT -> prints "TOTAL CHARS"
   local input="$1"
   mkdir -p "$S/chunks" "$S/wav"
-  sed -E 's/\[([^]]*)\]\([^)]*\)/\1/g; s/[#*`_>|]//g' "$input" \
+  expand_tables <"$input" \
+    | sed -E 's/\[([^]]*)\]\([^)]*\)/\1/g; s/[#*`>|]//g; s/_/ /g' \
     | awk -v dir="$S/chunks" -v sizes="$S/sizes" -v max="$CHUNK_CHARS" '
         function flush(  f) {
           if (buf == "") return
