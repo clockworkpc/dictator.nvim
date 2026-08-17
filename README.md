@@ -248,6 +248,32 @@ rather than mid-sentence. Blank lines between items still count as one list, and
 items are treated as continuing the list. Applies to `-`, `*`, and `+` bullets; numbered
 lists are left as they are.
 
+### Money
+
+Piper reads a currency symbol where it is written, so `$10,000` comes out as "dollar ten
+thousand". Amounts are rewritten the way they are spoken instead — the number first, then
+the currency name, singular or plural to match:
+
+| Written | Read |
+| ------- | ---- |
+| `$1` / `₪1` | one dollar / one shekel |
+| `$10` / `₪10` | ten dollars / ten shekels |
+| `$0.50` / `₪0.50` | fifty cents / fifty agorot |
+| `$10.99` | ten dollars and ninety-nine cents |
+| `$1.5 million` | one point five million dollars |
+| `US$20` | twenty US dollars |
+
+Under one unit the amount switches to the subunit, so `$0.50` is "fifty cents" rather
+than "zero point five dollars", and `$0.01` is "one cent" rather than "one cents". A
+magnitude word after the amount keeps its place between the number and the name, and `k`,
+`m`, `bn` are spelled out. `$`, `€`, `£`, `₪`, `₹`, `₽`, `¥`, and `₩` are recognised;
+`¥` and `₩` have no everyday subunit, so a fraction is read as-is.
+
+A letter prefix on `$` names a variant — `US`, `A`/`AU`, `C`/`CA`, `NZ`, `HK`, `SG` — and
+becomes an adjective. Anything else is left untouched rather than guessed at, so `R$5`
+is not read as dollars. `DICTATE_CURRENCY=off` disables the whole rewrite, which is worth
+knowing if the document is full of shell snippets where `$1` is a positional parameter.
+
 ### Markup that is skipped
 
 Raw HTML is dropped, so print scaffolding like
@@ -285,6 +311,7 @@ seconds-per-character rather than a guess.
 | `DICTATE_RUN_DIR`      | `/run/user/$UID/dictate` | Session state dir; override to run isolated sessions |
 | `DICTATE_CHIME`        | `on`                     | `off` disables the list-item chime |
 | `DICTATE_CHIME_DB`     | `-20`                    | Chime peak in dBFS; less negative = more present |
+| `DICTATE_CURRENCY`     | `on`                     | `off` reads currency amounts as written |
 
 The CLI also prints its session directory with `dictate rundir`; the plugin uses that to
 follow playback by reading the state files directly, including `lines`, which records the

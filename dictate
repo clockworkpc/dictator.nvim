@@ -143,6 +143,104 @@ expand_markup() {
     }'
 }
 
+# Piper reads "$10,000" symbol-first, as "dollar ten thousand", so amounts are rewritten
+# the way they are spoken: the number, then the currency name, singular or plural to match.
+# Amounts under one unit switch to the subunit, so "$0.50" is "50 cents" rather than
+# "zero point five dollars".
+#   $1          -> 1 dollar            ₪1     -> 1 shekel
+#   $10,000     -> 10,000 dollars      ₪10    -> 10 shekels
+#   $0.50       -> 50 cents            ₪0.50  -> 50 agorot
+#   $10.99      -> 10 dollars and 99 cents
+#   $1.5 million-> 1.5 million dollars US$20  -> 20 US dollars
+expand_currency() {
+  [[ "${DICTATE_CURRENCY:-on}" == off ]] && { cat; return 0; }
+  awk '
+    # money(SYMBOL, singular, plural, subunit singular, subunit plural)
+    function money(sym, s, p, ss, sp) {
+      SING[sym] = s; PLUR[sym] = p; SUBS[sym] = ss; SUBP[sym] = sp; SYM[++NSYM] = sym
+    }
+    BEGIN {
+      money("$", "dollar", "dollars", "cent", "cents")
+      money("€", "euro", "euros", "cent", "cents")
+      money("£", "pound", "pounds", "penny", "pence")
+      money("₪", "shekel", "shekels", "agora", "agorot")
+      money("₹", "rupee", "rupees", "paisa", "paise")
+      money("₽", "ruble", "rubles", "kopek", "kopeks")
+      money("¥", "yen", "yen", "", "")          # no subunit in everyday use
+      money("₩", "won", "won", "", "")
+      # A letter prefix names a variant of the same symbol; anything unlisted is left
+      # untouched rather than guessed at, so R$ is not read as dollars
+      ADJ["US"] = "US"; ADJ["A"] = "Australian"; ADJ["AU"] = "Australian"
+      ADJ["C"] = "Canadian"; ADJ["CA"] = "Canadian"; ADJ["NZ"] = "New Zealand"
+      ADJ["HK"] = "Hong Kong"; ADJ["SG"] = "Singapore"
+      # A magnitude following the amount belongs between the number and the name
+      WORD["thousand"] = "thousand"; WORD["million"] = "million"
+      WORD["billion"] = "billion"; WORD["trillion"] = "trillion"
+      WORD["k"] = "thousand"; WORD["m"] = "million"
+      WORD["bn"] = "billion"; WORD["b"] = "billion"; WORD["tn"] = "trillion"
+      # alternation, not a bracket expression: the symbols are multi-byte
+      RE = "(\\$|€|£|₪|₹|₽|¥|₩)[ ]?[0-9][0-9,]*(\\.[0-9]+)?"
+    }
+    function name(sym, adj, plural,   n) {
+      n = plural ? PLUR[sym] : SING[sym]
+      return (adj == "" ? n : adj " " n)
+    }
+    # "07" -> 7, and a short fraction is a subunit count: ".5" is 50 cents, not 5
+    function subunits(frac) {
+      if (length(frac) == 1) frac = frac "0"
+      return frac + 0
+    }
+    function spoken(sym, adj, num, mag,   plain, dot, whole, frac, val, cents) {
+      plain = num; gsub(/,/, "", plain)
+      val = plain + 0
+      dot = index(plain, ".")
+      whole = dot ? substr(plain, 1, dot - 1) : plain
+      frac  = dot ? substr(plain, dot + 1) : ""
+      if (frac ~ /^0*$/) { frac = ""; if (dot) num = substr(num, 1, index(num, ".") - 1) }
+      if (mag != "") return num " " mag " " name(sym, adj, 1)   # a million of it is plural
+      # a fraction only splits out when it is a whole number of subunits
+      if (frac != "" && length(frac) <= 2 && SUBP[sym] != "") {
+        cents = subunits(frac)
+        if (val < 1) return cents " " (cents == 1 ? SUBS[sym] : SUBP[sym])
+        return substr(num, 1, index(num, ".") - 1) " " name(sym, adj, whole + 0 != 1) \
+               " and " cents " " (cents == 1 ? SUBS[sym] : SUBP[sym])
+      }
+      return num " " name(sym, adj, val != 1)
+    }
+    function expand(line,   out, pre, tok, rest, sym, adj, num, mag, w, i) {
+      out = ""
+      while (match(line, RE)) {
+        pre  = substr(line, 1, RSTART - 1)
+        tok  = substr(line, RSTART, RLENGTH)
+        rest = substr(line, RSTART + RLENGTH)
+        sym = ""
+        for (i = 1; i <= NSYM; i++) if (index(tok, SYM[i]) == 1) { sym = SYM[i]; break }
+        num = substr(tok, length(sym) + 1); sub(/^ /, "", num)
+        # a comma that ends the amount is punctuation, not a thousands separator
+        if (match(num, /,+$/)) { rest = substr(num, RSTART) rest; num = substr(num, 1, RSTART - 1) }
+        adj = ""
+        if (match(pre, /[0-9]$/)) { out = out pre tok; line = rest; continue }
+        if (match(pre, /[A-Za-z]+$/)) {
+          w = substr(pre, RSTART, RLENGTH)
+          if (sym != "$" || !(toupper(w) in ADJ)) { out = out pre tok; line = rest; continue }
+          adj = ADJ[toupper(w)]
+          pre = substr(pre, 1, RSTART - 1)
+        }
+        mag = ""
+        if (match(rest, /^[ ]?[A-Za-z]+/)) {
+          w = substr(rest, RSTART, RLENGTH); sub(/^ /, "", w)
+          if (tolower(w) in WORD) { mag = WORD[tolower(w)]; rest = substr(rest, RSTART + RLENGTH) }
+        }
+        # the name now ends in a letter, so an abbreviation left behind needs a gap
+        if (rest ~ /^[A-Za-z0-9]/) rest = " " rest
+        out = out pre spoken(sym, adj, num, mag)
+        line = rest
+      }
+      return out line
+    }
+    { print expand($0) }'
+}
+
 # A soft 880 Hz sine, 280 ms, faded in and out and kept well under the voice, marking
 # the start of each list item. Generated at the voice's own sample rate so it can be
 # concatenated with the synthesized speech; falls back to the shipped asset if sox is
@@ -172,6 +270,7 @@ build_chunks() { # build_chunks INPUT -> prints "TOTAL CHARS"
               s/^[[:space:]]*#+[[:space:]]*//
               s/^[[:space:]]*>+[[:space:]]*//
               s/[*`|]//g; s/_/ /g' \
+    | expand_currency \
     | awk -v dir="$S/chunks" -v sizes="$S/sizes" -v marks="$S/marks" -v lines="$S/lines" -v max="$CHUNK_CHARS" '
         function flush(  f) {
           if (buf == "") return
